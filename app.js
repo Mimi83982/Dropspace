@@ -17,8 +17,14 @@ const fileNameDisplay = document.getElementById('fileName');
 const peer = new Peer();
 let connection = null;
 let pendingFile = null; 
-// 64 KB adalah ukuran paling optimal dan aman untuk raw binary WebRTC DataChannel
-const CHUNK_SIZE = 64 * 1024; 
+
+// UKURAN OPTIMAL: 256 KB mengurangi beban pembacaan file dan meningkatkan kecepatan transfer secara drastis
+const CHUNK_SIZE = 256 * 1024; 
+
+// Variabel Tambahan untuk Stream ke Disk (Mengatasi Limit RAM)
+let fileWritableStream = null;
+let writeQueue = [];
+let isWriting = false;
 
 // --- INISIALISASI JARINGAN ---
 peer.on('open', (id) => {
@@ -50,13 +56,20 @@ peer.on('connection', (conn) => {
             statusText.innerText = "Penerima terhubung! Menunggu Anda memilih file...";
         }
     });
+
+    // SENDER mendengarkan respon dari RECEIVER
+    connection.on('data', (data) => {
+        if (data && data.type === 'ready') {
+            statusText.innerText = "Penerima siap. Memulai transfer data...";
+            sendFileChunks(pendingFile);
+        }
+    });
 });
 
 function setupSenderEvents(myId) {
     const fullUrl = `${window.location.origin}${window.location.pathname}?room=${myId}`;
     shareUrl.innerText = fullUrl;
     
-    // Pastikan qrcode container ada di HTML
     if (document.getElementById("qrcode")) {
         new QRCode(document.getElementById("qrcode"), { text: fullUrl, width: 144, height: 144 });
     }
@@ -98,20 +111,17 @@ function handleFileSelect(file) {
 }
 
 function startTransfer(file) {
-    statusText.innerText = "Memulai transfer...";
+    statusText.innerText = "Mengirim metadata, menunggu konfirmasi penyimpanan dari penerima...";
     progressSection.classList.remove('hidden');
     fileNameDisplay.innerText = file.name;
 
-    // FIX: Kirim Metadata beserta tipe MIME file
+    // Kirim Metadata terlebih dahulu
     connection.send({ 
         type: 'metadata', 
         name: file.name, 
         size: file.size, 
         fileType: file.type 
     });
-
-    // Kasih jeda 1 detik sebelum kirim file agar koneksi stabil
-    setTimeout(() => { sendFileChunks(file); }, 1000);
 }
 
 function sendFileChunks(file) {
@@ -119,7 +129,6 @@ function sendFileChunks(file) {
     const reader = new FileReader();
     const dc = connection.dataChannel; 
 
-    // Set ambang batas buffer untuk trigger onbufferedamountlow
     if (dc) {
         dc.bufferedAmountLowThreshold = 512 * 1024; // 512 KB
     }
@@ -127,7 +136,6 @@ function sendFileChunks(file) {
     reader.onload = function(e) {
         if (!connection) return;
 
-        // Kirim RAW Data (ArrayBuffer langsung)
         connection.send(e.target.result);
         offset += e.target.result.byteLength;
 
@@ -136,25 +144,29 @@ function sendFileChunks(file) {
         progressPercent.innerText = percentage + '%';
 
         if (offset < file.size) {
-            // Rem jika antrean buffer > 1MB
-            if (dc && dc.bufferedAmount > 1024 * 1024) {
+            // Rem kecepatan pengiriman jika buffer antrean jaringan penuh (> 2MB)
+            if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
                 dc.onbufferedamountlow = () => {
-                    dc.onbufferedamountlow = null; // Bersihkan event listener
-                    readNext(); // Lanjut baca file
+                    dc.onbufferedamountlow = null; 
+                    readNext(); 
                 };
             } else {
-                readNext();
+                // Berikan sedikit jeda per 10 chunk agar browser tidak membeku (unresponsive UI)
+                if (offset % (CHUNK_SIZE * 10) === 0) {
+                    setTimeout(readNext, 1);
+                } else {
+                    readNext();
+                }
             }
         } else {
-            statusText.innerText = "Menyelesaikan pengiriman...";
-            // Tunggu semua data di buffer jaringan benar-benar terkuras
+            statusText.innerText = "Menyelesaikan pengiriman ke disk penerima...";
             const waitDrain = setInterval(() => {
                 if (!dc || dc.bufferedAmount === 0) {
                     clearInterval(waitDrain);
-                    connection.send({ type: 'done' }); // Kirim sinyal selesai
+                    connection.send({ type: 'done' }); 
                     statusText.innerText = "File Berhasil Dikirim!";
                 }
-            }, 50);
+            }, 100);
         }
     };
 
@@ -175,63 +187,106 @@ function connectToSender(targetId) {
     let receivedSize = 0;
 
     connection.on('open', () => {
-        statusText.innerText = "Terhubung dengan pengirim!";
+        statusText.innerText = "Terhubung dengan pengirim. Menunggu data file...";
         if (receiverZone) receiverZone.classList.add('hidden');
-        progressSection.classList.remove('hidden');
     });
 
-    connection.on('data', (data) => {
-        // FIX 1: Support ArrayBuffer, TypedArrays (Uint8Array), and Blobs
+    connection.on('data', async (data) => {
+        // 1. Jika data berupa binary (Chunk File)
         if (data instanceof ArrayBuffer || ArrayBuffer.isView(data) || data instanceof Blob) {
-            receivedChunks.push(data);
             
-            // Handle both ArrayBuffer/TypedArray (byteLength) and Blob (size)
+            if (fileWritableStream) {
+                // Masukkan ke antrean tulis disk untuk menghindari race condition
+                writeQueue.push(data);
+                processWriteQueue();
+            } else {
+                // Fallback ke RAM jika browser tidak mendukung File System Access API
+                receivedChunks.push(data);
+            }
+
             receivedSize += data.byteLength !== undefined ? data.byteLength : data.size;
 
             const percentage = fileMeta ? Math.floor((receivedSize / fileMeta.size) * 100) : 0;
             progressBar.style.width = percentage + '%';
             progressPercent.innerText = percentage + '%';
         } 
-        // Jika data yang diterima adalah Object (Metadata / Sinyal Kontrol)
+        // 2. Jika data berupa Object (Metadata / Sinyal Kontrol)
         else if (data && typeof data === 'object') {
             if (data.type === 'metadata') {
                 fileMeta = data;
                 fileNameDisplay.innerText = fileMeta.name;
+                progressSection.classList.remove('hidden');
+                
                 receivedChunks = [];
                 receivedSize = 0;
-            } else if (data.type === 'done') {
-                if (fileMeta && receivedSize < fileMeta.size) {
-                    console.warn(`Ukuran diterima (${receivedSize}) lebih kecil dari ukuran asli (${fileMeta.size}). File mungkin tidak lengkap.`);
-                }
 
+                // Fitur Utama: Deteksi kecocokan File System Access API untuk file besar
+                if (window.showSaveFilePicker) {
+                    statusText.innerHTML = `
+                        <div class="text-center">
+                            <p class="mb-2 font-semibold text-amber-500">File Besar Terdeteksi (${(fileMeta.size / (1024*1024*1024)).toFixed(2)} GB)</p>
+                            <button id="downloadBtn" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded shadow-md transition-all">
+                                Pilih Lokasi Simpan & Mulai Terima
+                            </button>
+                        </div>
+                    `;
+                    
+                    document.getElementById('downloadBtn').addEventListener('click', async () => {
+                        try {
+                            const handle = await window.showSaveFilePicker({ suggestedName: fileMeta.name });
+                            fileWritableStream = await handle.createWritable();
+                            statusText.innerText = "Mempersiapkan harddisk, mendownload...";
+                            // Kirim sinyal siap ke pengirim setelah file lokal siap ditulis
+                            connection.send({ type: 'ready' });
+                        } catch (err) {
+                            statusText.innerText = "Gagal membuka akses penyimpanan file / Dibatalkan.";
+                            console.error(err);
+                        }
+                    });
+                } else {
+                    // Fallback normal untuk browser non-Chromium (seperti Firefox/Safari mobile)
+                    statusText.innerText = "Menerima file (Disimpan di RAM, berisiko crash pada file > 1.5GB)...";
+                    connection.send({ type: 'ready' });
+                }
+            } 
+            
+            else if (data.type === 'done') {
                 progressBar.style.width = '100%';
                 progressPercent.innerText = '100%';
-                statusText.innerText = "Selesai! Mengunduh...";
 
-                // FIX 2: Attach the correct MIME type to the Blob
-                const blobOptions = fileMeta.fileType ? { type: fileMeta.fileType } : {};
-                const blob = new Blob(receivedChunks, blobOptions);
-                
-                // FIX 3: Mobile Chrome Download Workaround
-                const link = document.createElement('a');
-                const blobUrl = URL.createObjectURL(blob);
-                link.href = blobUrl;
-                link.download = fileMeta ? fileMeta.name : 'file_unduhan';
-                
-                // Harus ditempel ke DOM dulu agar mobile Chrome mengeksekusi kliknya
-                document.body.appendChild(link);
-                link.click();
-                
-                // Bersihkan DOM
-                document.body.removeChild(link);
+                if (fileWritableStream) {
+                    // Tunggu antrean tulis disk benar-benar kosong sebelum menutup file
+                    const checkDone = setInterval(async () => {
+                        if (writeQueue.length === 0 && !isWriting) {
+                            clearInterval(checkDone);
+                            await fileWritableStream.close();
+                            fileWritableStream = null;
+                            statusText.innerText = "Selesai! File berhasil disimpan langsung ke disk lokal Anda.";
+                        } else {
+                            statusText.innerText = "Sedang menulis sisa data terakhir ke disk...";
+                        }
+                    }, 100);
+                } else {
+                    // Eksekusi download fallback konvensional dari RAM
+                    statusText.innerText = "Selesai! Mengompilasi file dari RAM...";
+                    const blobOptions = fileMeta.fileType ? { type: fileMeta.fileType } : {};
+                    const blob = new Blob(receivedChunks, blobOptions);
+                    const blobUrl = URL.createObjectURL(blob);
+                    
+                    const link = document.createElement('a');
+                    link.href = blobUrl;
+                    link.download = fileMeta ? fileMeta.name : 'file_unduhan';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
 
-                // FIX 4: Kosongkan RAM agar browser tidak crash pada file berukuran besar
-                setTimeout(() => {
-                    URL.revokeObjectURL(blobUrl);
-                    receivedChunks = []; 
-                }, 1000);
+                    setTimeout(() => {
+                        URL.revokeObjectURL(blobUrl);
+                        receivedChunks = []; 
+                    }, 1000);
 
-                statusText.innerText = "File berhasil disimpan.";
+                    statusText.innerText = "File berhasil disimpan.";
+                }
             }
         }
     });
@@ -246,4 +301,20 @@ function connectToSender(targetId) {
         console.error(err);
         statusText.innerText = "Terjadi error saat transfer.";
     });
+}
+
+// Fungsi asinkronus untuk menjamin penulisan ke disk berjalan urut (tidak tumpang tindih)
+async function processWriteQueue() {
+    if (isWriting || writeQueue.length === 0) return;
+    isWriting = true;
+    
+    while (writeQueue.length > 0) {
+        const chunk = writeQueue.shift();
+        try {
+            await fileWritableStream.write(chunk);
+        } catch (err) {
+            console.error("Gagal menulis chunk ke disk:", err);
+        }
+    }
+    isWriting = false;
 }
