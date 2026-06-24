@@ -15,7 +15,14 @@ const progressPercent = document.getElementById('progressPercent');
 const fileNameDisplay = document.getElementById('fileName');
 const speedText = document.getElementById('speedText'); // FIX: Hubungkan ke elemen HTML speedText
 
-const peer = new Peer();
+const peer = new Peer({
+    config: {
+        'iceServers': [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+        ]
+    }
+});
 let connection = null;
 let pendingFile = null; 
 
@@ -177,7 +184,7 @@ function sendFileChunks(file) {
 
 // --- LOGIKA RECEIVER (PENERIMA) ---
 function connectToSender(targetId) {
-    connection = peer.connect(targetId);
+    connection = peer.connect(targetId, { reliable: true });
 
     let receivedChunks = [];
     let fileMeta = null;
