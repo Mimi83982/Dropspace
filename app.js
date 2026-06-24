@@ -102,8 +102,13 @@ function startTransfer(file) {
     progressSection.classList.remove('hidden');
     fileNameDisplay.innerText = file.name;
 
-    // Kirim Metadata (Tipe Object)
-    connection.send({ type: 'metadata', name: file.name, size: file.size });
+    // FIX: Kirim Metadata beserta tipe MIME file
+    connection.send({ 
+        type: 'metadata', 
+        name: file.name, 
+        size: file.size, 
+        fileType: file.type 
+    });
 
     // Kasih jeda 1 detik sebelum kirim file agar koneksi stabil
     setTimeout(() => { sendFileChunks(file); }, 1000);
@@ -176,10 +181,12 @@ function connectToSender(targetId) {
     });
 
     connection.on('data', (data) => {
-        // Cek jika data yang diterima adalah RAW Data (ArrayBuffer)
-        if (data instanceof ArrayBuffer) {
+        // FIX 1: Support ArrayBuffer, TypedArrays (Uint8Array), and Blobs
+        if (data instanceof ArrayBuffer || ArrayBuffer.isView(data) || data instanceof Blob) {
             receivedChunks.push(data);
-            receivedSize += data.byteLength;
+            
+            // Handle both ArrayBuffer/TypedArray (byteLength) and Blob (size)
+            receivedSize += data.byteLength !== undefined ? data.byteLength : data.size;
 
             const percentage = fileMeta ? Math.floor((receivedSize / fileMeta.size) * 100) : 0;
             progressBar.style.width = percentage + '%';
@@ -201,12 +208,28 @@ function connectToSender(targetId) {
                 progressPercent.innerText = '100%';
                 statusText.innerText = "Selesai! Mengunduh...";
 
-                // Proses penggabungan chunk menjadi file utuh
-                const blob = new Blob(receivedChunks);
+                // FIX 2: Attach the correct MIME type to the Blob
+                const blobOptions = fileMeta.fileType ? { type: fileMeta.fileType } : {};
+                const blob = new Blob(receivedChunks, blobOptions);
+                
+                // FIX 3: Mobile Chrome Download Workaround
                 const link = document.createElement('a');
-                link.href = URL.createObjectURL(blob);
+                const blobUrl = URL.createObjectURL(blob);
+                link.href = blobUrl;
                 link.download = fileMeta ? fileMeta.name : 'file_unduhan';
+                
+                // Harus ditempel ke DOM dulu agar mobile Chrome mengeksekusi kliknya
+                document.body.appendChild(link);
                 link.click();
+                
+                // Bersihkan DOM
+                document.body.removeChild(link);
+
+                // FIX 4: Kosongkan RAM agar browser tidak crash pada file berukuran besar
+                setTimeout(() => {
+                    URL.revokeObjectURL(blobUrl);
+                    receivedChunks = []; 
+                }, 1000);
 
                 statusText.innerText = "File berhasil disimpan.";
             }
